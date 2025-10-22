@@ -1,0 +1,274 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// Wi-Fi credentials
+const char* ssid = "Stone age";
+const char* password = "stoneage";
+
+// Firebase credentials
+#define API_KEY "AIzaSyB2tPvQOKoMCdvaf_GF8ehpOfPsZnini00"
+#define DATABASE_URL "https://iot-myqrmart-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL "stoneage.proddatur@gmail.com"
+#define USER_PASSWORD "Bl@ckH0l3"
+
+// GPIO Definitions
+#define relay0 15
+#define relay1 2
+#define relay2 4
+#define switch0 13  // Physical switch for relay0
+#define switch1 12  // Physical switch for relay1
+#define switch2 14  // Physical switch for relay2
+
+// Debounce time in milliseconds
+#define DEBOUNCE_DELAY 50
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Timing variables
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastStatusUpdate = 0;
+const unsigned long fbUpdateInterval = 2000;    // Check Firebase every 2s
+const unsigned long statusUpdateInterval = 30000; // Update status every 30s
+const unsigned long wifiRetryInterval = 10000;  // Retry WiFi every 10s
+
+// State variables
+bool lastSwitchState[3] = {HIGH, HIGH, HIGH};
+bool currentSwitchState[3] = {HIGH, HIGH, HIGH};
+bool lastDebounceState[3] = {HIGH, HIGH, HIGH};
+unsigned long lastDebounceTime[3] = {0, 0, 0};
+bool currentRelayState[3] = {LOW, LOW, LOW};
+
+// Connection State Machine
+enum ConnectionState {
+  STATE_DISCONNECTED,
+  STATE_WIFI_CONNECTING,
+  STATE_WIFI_CONNECTED,
+  STATE_FIREBASE_CONNECTING,
+  STATE_FIREBASE_CONNECTED
+};
+ConnectionState connectionState = STATE_DISCONNECTED;
+unsigned long lastConnectionAttempt = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize GPIOs
+  pinMode(relay0, OUTPUT);
+  pinMode(relay1, OUTPUT);
+  pinMode(relay2, OUTPUT);
+  pinMode(switch0, INPUT_PULLUP);
+  pinMode(switch1, INPUT_PULLUP);
+  pinMode(switch2, INPUT_PULLUP);
+
+  // Start with relays off
+  digitalWrite(relay0, LOW);
+  digitalWrite(relay1, LOW);
+  digitalWrite(relay2, LOW);
+
+  // Initialize Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // Start connection process
+  connectionState = STATE_WIFI_CONNECTING;
+  WiFi.begin(ssid, password);
+  lastConnectionAttempt = millis();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Handle physical switches - always runs with debouncing
+  handlePhysicalSwitches(currentMillis);
+
+  // Handle connection state machine - non-blocking
+  updateConnectionState(currentMillis);
+
+  // Handle Firebase updates when connected
+  if (connectionState == STATE_FIREBASE_CONNECTED) {
+    if (currentMillis - lastFirebaseUpdate >= fbUpdateInterval) {
+      updateRelaysFromFirebase();
+      lastFirebaseUpdate = currentMillis;
+    }
+
+    if (currentMillis - lastStatusUpdate >= statusUpdateInterval) {
+      Firebase.RTDB.setBool(&fbdo, "/deviceStatus/online", true);
+      lastStatusUpdate = currentMillis;
+    }
+  }
+}
+
+void handlePhysicalSwitches(unsigned long currentMillis) {
+  for (int i = 0; i < 3; i++) {
+    int pin;
+    switch(i) {
+      case 0: pin = switch0; break;
+      case 1: pin = switch1; break;
+      case 2: pin = switch2; break;
+    }
+    
+    // Read the current switch state
+    bool reading = digitalRead(pin);
+
+    // Check if the switch state has changed (due to noise or pressing)
+    if (reading != lastDebounceState[i]) {
+      // Reset the debouncing timer
+      lastDebounceTime[i] = currentMillis;
+      lastDebounceState[i] = reading;
+    }
+
+    // If the reading has been stable longer than the debounce delay
+    if ((currentMillis - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
+      // If the switch state has changed
+      if (reading != currentSwitchState[i]) {
+        currentSwitchState[i] = reading;
+        handleSwitchAction(i, reading);
+      }
+    }
+    
+    // Save the last stable state
+    lastSwitchState[i] = currentSwitchState[i];
+  }
+}
+
+void handleSwitchAction(int relayIndex, bool switchState) {
+  int relayPin;
+  switch(relayIndex) {
+    case 0: relayPin = relay0; break;
+    case 1: relayPin = relay1; break;
+    case 2: relayPin = relay2; break;
+  }
+  
+  // For both online and offline modes - direct control
+  bool newRelayState = (switchState == LOW) ? HIGH : LOW; // Invert because switch is active LOW
+  
+  // Only update if state actually changed
+  if (newRelayState != currentRelayState[relayIndex]) {
+    digitalWrite(relayPin, newRelayState);
+    currentRelayState[relayIndex] = newRelayState;
+    
+    Serial.print("Relay ");
+    Serial.print(relayIndex + 1);
+    Serial.print(" set to ");
+    Serial.println(newRelayState ? "ON" : "OFF");
+
+    // If connected to Firebase, update the remote state
+    if (connectionState == STATE_FIREBASE_CONNECTED) {
+      updateFirebaseRelayState(relayIndex);
+    }
+  }
+}
+
+void updateFirebaseRelayState(int relayIndex) {
+  String path;
+  switch(relayIndex) {
+    case 0: path = "/relays/relay1"; break;
+    case 1: path = "/relays/relay2"; break;
+    case 2: path = "/relays/relay3"; break;
+  }
+  
+  if (Firebase.RTDB.setBool(&fbdo, path, currentRelayState[relayIndex])) {
+    Serial.print("Updated Firebase relay");
+    Serial.print(relayIndex + 1);
+    Serial.print(" to ");
+    Serial.println(currentRelayState[relayIndex] ? "ON" : "OFF");
+  } else {
+    Serial.println("Firebase update failed: " + fbdo.errorReason());
+  }
+}
+
+void updateConnectionState(unsigned long currentMillis) {
+  switch(connectionState) {
+    case STATE_DISCONNECTED:
+      if (currentMillis - lastConnectionAttempt >= wifiRetryInterval) {
+        connectionState = STATE_WIFI_CONNECTING;
+        WiFi.begin(ssid, password);
+        lastConnectionAttempt = currentMillis;
+        Serial.println("Attempting WiFi connection...");
+      }
+      break;
+
+    case STATE_WIFI_CONNECTING:
+      if (WiFi.status() == WL_CONNECTED) {
+        connectionState = STATE_WIFI_CONNECTED;
+        Serial.println("WiFi connected");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+      } else if (currentMillis - lastConnectionAttempt >= wifiRetryInterval) {
+        connectionState = STATE_DISCONNECTED;
+        Serial.println("WiFi connection timeout");
+      }
+      break;
+
+    case STATE_WIFI_CONNECTED:
+      connectionState = STATE_FIREBASE_CONNECTING;
+      Firebase.begin(&config, &auth);
+      Firebase.reconnectWiFi(true);
+      lastConnectionAttempt = currentMillis;
+      Serial.println("Attempting Firebase connection...");
+      break;
+
+    case STATE_FIREBASE_CONNECTING:
+      if (auth.token.uid.length() > 0) {
+        connectionState = STATE_FIREBASE_CONNECTED;
+        Serial.println("Firebase connected");
+        // Initial status update
+        Firebase.RTDB.setBool(&fbdo, "/deviceStatus/online", true);
+        lastStatusUpdate = currentMillis;
+      } else if (currentMillis - lastConnectionAttempt >= wifiRetryInterval) {
+        connectionState = STATE_WIFI_CONNECTED; // Fall back to WiFi state
+        Serial.println("Firebase connection timeout");
+      }
+      break;
+
+    case STATE_FIREBASE_CONNECTED:
+      if (WiFi.status() != WL_CONNECTED) {
+        connectionState = STATE_DISCONNECTED;
+        Serial.println("Lost WiFi connection");
+        Firebase.RTDB.setBool(&fbdo, "/deviceStatus/online", false);
+      }
+      break;
+  }
+}
+
+void updateRelaysFromFirebase() {
+  if (connectionState != STATE_FIREBASE_CONNECTED) return;
+
+  // Relay 1
+  if (Firebase.RTDB.getBool(&fbdo, "/relays/relay1")) {
+    bool state = fbdo.boolData();
+    if (state != currentRelayState[0]) {
+      digitalWrite(relay0, state);
+      currentRelayState[0] = state;
+      Serial.print("Relay 1 updated from Firebase to ");
+      Serial.println(state ? "ON" : "OFF");
+    }
+  }
+
+  // Relay 2
+  if (Firebase.RTDB.getBool(&fbdo, "/relays/relay2")) {
+    bool state = fbdo.boolData();
+    if (state != currentRelayState[1]) {
+      digitalWrite(relay1, state);
+      currentRelayState[1] = state;
+      Serial.print("Relay 2 updated from Firebase to ");
+      Serial.println(state ? "ON" : "OFF");
+    }
+  }
+
+  // Relay 3
+  if (Firebase.RTDB.getBool(&fbdo, "/relays/relay3")) {
+    bool state = fbdo.boolData();
+    if (state != currentRelayState[2]) {
+      digitalWrite(relay2, state);
+      currentRelayState[2] = state;
+      Serial.print("Relay 3 updated from Firebase to ");
+      Serial.println(state ? "ON" : "OFF");
+    }
+  }
+}

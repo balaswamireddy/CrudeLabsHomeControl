@@ -1,0 +1,27 @@
+// File to update the main.dart to use our new screen implementations
+
+// 1. In main.dart: Change import statements
+//   - Add: import 'screens/home_screen_new.dart';
+//   - Add: import 'screens/board_list_screen_new.dart'; 
+//   - Add: import 'screens/switch_control_screen_new.dart';
+//   - Modify imports to use the new files
+
+// 2. Replace routes in onGenerateRoute to use the new screen implementations:
+//    - Replace HomeScreen with HomeScreen from home_screen_new.dart
+//    - No change needed for route handling since the class names are the same
+
+// How to apply these changes:
+//    1. Open main.dart
+//    2. Add the new imports at the top of the file
+//    3. The routes should automatically use the new implementations
+//    4. Build and test the application
+
+// This approach allows us to make the changes without breaking the existing code
+// and easily revert if needed by removing the new imports.
+
+// NOTE: If you want to keep both versions (old and new), you could rename
+// the classes in the new files (e.g., HomeScreenImproved) and update route handlers.
+
+// If you want to apply the changes more comprehensively:
+// Replace all instances of AnimatedSkyBackground directly wrapping components in 
+// the code with DynamicBackgroundWidget to ensure consistent theme application.

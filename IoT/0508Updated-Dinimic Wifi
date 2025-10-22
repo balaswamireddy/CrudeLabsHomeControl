@@ -1,0 +1,436 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Firebase_ESP_Client.h>
+#include <EEPROM.h>
+
+// **************************************************
+// ** Set these values before compiling & uploading **
+// ** NEVER upload these values to a public repository **
+// ** Replace xxxxxx with your actual Firebase project values **
+// **************************************************
+
+#define API_KEY "AIzaSyB2tPvQOKoMCdvaf_GF8ehpOfPsZnini00" // Your Firebase Web API Key (from project settings)
+#define DATABASE_URL "https://iot-myqrmart-default-rtdb.asia-southeast1.firebasedatabase.app/" // Your Firebase Realtime Database URL (from project settings)
+
+// ** End of required project settings **
+
+// **************************************************
+
+// EEPROM Configuration
+#define EEPROM_SIZE 256                   // 256 bytes: 4x64-byte credentials
+#define SSID_ADDR 0                       // WiFi SSID starts at 0
+#define PASS_ADDR 64                      // WiFi Password starts at 64
+#define FIREBASE_EMAIL_ADDR 128           // Firebase Email starts at 128
+#define FIREBASE_PASS_ADDR 192            // Firebase Password starts at 192
+#define CRED_MAXLEN 64                    // Max length for any credential
+
+// Hardware Configuration
+#define relay0 4
+#define relay1 2
+#define relay2 15
+#define switch0 14
+#define switch1 12
+#define switch2 13
+#define CONFIG_BUTTON_PIN 5
+#define STATUS_LED 23
+
+// Network Configuration (leave these as-is)
+#define CONFIG_AP_NAME "StoneageSmartSwitch(3)"
+#define CONFIG_AP_PASSWORD "stoneage"
+#define BUTTON_HOLD_TIME 2000L
+#define CONFIG_AP_TIMEOUT 300000L
+
+// Timings
+#define DEBOUNCE_DELAY 50
+#define FB_UPDATE_INTERVAL 2000
+#define STATUS_UPDATE_INTERVAL 30000
+#define WIFI_RETRY_INTERVAL 10000
+
+// Safety for RAM
+#define MIN_HEAP_BEFORE_CRASH 80000
+#define MAX_SSL_ERRORS 3
+#define MAX_FB_ERRORS 3
+
+WebServer server(80);
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// State Arrays - Fixed array declarations
+bool lastSwitchState[3] = {HIGH, HIGH, HIGH};
+bool currentSwitchState[3] = {HIGH, HIGH, HIGH};
+bool lastDebounceState[3] = {HIGH, HIGH, HIGH};
+unsigned long lastDebounceTime[3] = {0, 0, 0};
+bool currentRelayState[3] = {LOW, LOW, LOW};
+bool inConfigMode = false;
+
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastStatusUpdate = 0;
+unsigned long lastConnectionAttempt = 0;
+unsigned long configAPStartTime = 0;
+
+int sslErrorCount = 0;
+int fbErrorCount = 0;
+
+// Connection State Machine
+enum ConnectionState {
+    STATE_DISCONNECTED,
+    STATE_WIFI_CONNECTING,
+    STATE_WIFI_CONNECTED,
+    STATE_FIREBASE_CONNECTING,
+    STATE_FIREBASE_CONNECTED
+};
+ConnectionState connectionState = STATE_DISCONNECTED;
+
+// -------------  EEPROM Utility Functions  -------------
+void writeEEPROM(int addr, String data) {
+    int i = 0;
+    for (; i < data.length() && i < CRED_MAXLEN - 1; ++i)
+        EEPROM.write(addr + i, data[i]);
+    for (; i < CRED_MAXLEN; ++i)
+        EEPROM.write(addr + i, 0);
+    EEPROM.commit();
+}
+
+String readEEPROM(int addr) {
+    String data;
+    for (int i = addr; i < addr + CRED_MAXLEN; ++i) {
+        char c = EEPROM.read(i);
+        if (c == 0) break;
+        data += c;
+    }
+    return data;
+}
+
+// -------------  Button Hold Detection  -------------
+bool checkButtonHold() {
+    static unsigned long pressStart = 0;
+    if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+        if (!pressStart) pressStart = millis();
+        else if (millis() - pressStart >= BUTTON_HOLD_TIME) {
+            pressStart = 0;
+            return true;
+        }
+    } else {
+        pressStart = 0;
+    }
+    return false;
+}
+
+// -------------  Status LED  -------------
+void ledPattern(int type = 0) { // 0=off, 1=blink-fast, 2=blink-slow, 3=error
+    switch (type) {
+        case 0: digitalWrite(STATUS_LED, LOW); break;
+        case 1: digitalWrite(STATUS_LED, millis() % 300 < 100); break;
+        case 2: digitalWrite(STATUS_LED, millis() % 1000 < 50); break;
+        case 3: digitalWrite(STATUS_LED, millis() % 200 < 100); break;
+    }
+}
+
+// -------------  Switch Debouncing & Relay Control  -------------
+void handlePhysicalSwitches(unsigned long now) {
+    for (int i = 0; i < 3; i++) {
+        int pin = (i == 0) ? switch0 : (i == 1) ? switch1 : switch2;
+        bool reading = digitalRead(pin);
+        if (reading != lastDebounceState[i]) {
+            lastDebounceTime[i] = now;
+            lastDebounceState[i] = reading;
+        }
+        if ((now - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
+            if (reading != currentSwitchState[i]) {
+                currentSwitchState[i] = reading;
+                handleSwitchAction(i, reading);
+            }
+        }
+        lastSwitchState[i] = currentSwitchState[i];
+    }
+}
+
+void handleSwitchAction(int relayIndex, bool switchState) {
+    int relayPin = (relayIndex == 0) ? relay0 : (relayIndex == 1) ? relay1 : relay2;
+    bool newRelayState = (switchState == LOW) ? HIGH : LOW;
+    if (newRelayState != currentRelayState[relayIndex]) {
+        digitalWrite(relayPin, newRelayState);
+        currentRelayState[relayIndex] = newRelayState;
+        Serial.print("Relay ");
+        Serial.print(relayIndex + 1);
+        Serial.print(" set to ");
+        Serial.println(newRelayState ? "ON" : "OFF");
+        // Firebase remote update
+        if (connectionState == STATE_FIREBASE_CONNECTED && Firebase.ready()) {
+            bool ok = updateFirebaseRelayState(relayIndex);
+            if (!ok && ++sslErrorCount >= MAX_SSL_ERRORS) {
+                Serial.println("SSL/FB error on relay update. Restarting.");
+                delay(400);
+                ESP.restart();
+            }
+        }
+        sslErrorCount = 0;
+    }
+}
+
+// -------------  Firebase Relay Sync  -------------
+bool updateRelaysFromFirebase() {
+    bool ok[3];
+    bool states[3];
+    
+    ok[0] = Firebase.RTDB.getBool(&fbdo, "/2025Saaa08/switchs/switch1");
+    states[0] = ok[0] ? fbdo.boolData() : currentRelayState[0];
+    
+    ok[1] = Firebase.RTDB.getBool(&fbdo, "/2025Saaa08/switchs/switch2");
+    states[1] = ok[1] ? fbdo.boolData() : currentRelayState[1];
+    
+    ok[2] = Firebase.RTDB.getBool(&fbdo, "/2025Saaa08/switchs/switch3");
+    states[2] = ok[2] ? fbdo.boolData() : currentRelayState[2];
+    
+    for (int i = 0; i < 3; i++) {
+        int relayPin = (i == 0) ? relay0 : (i == 1) ? relay1 : relay2;
+        if (states[i] != currentRelayState[i]) {
+            digitalWrite(relayPin, states[i]);
+            currentRelayState[i] = states[i];
+            Serial.print("Relay ");
+            Serial.print(i + 1);
+            Serial.print(" updated from Firebase to ");
+            Serial.println(states[i] ? "ON" : "OFF");
+        }
+    }
+    return ok[0] && ok[1] && ok[2];
+}
+
+bool updateFirebaseRelayState(int relayIndex) {
+    String path = relayIndex == 0 ? "/2025Saaa08/switchs/switch1" : 
+                  relayIndex == 1 ? "/2025Saaa08/switchs/switch2" : 
+                  "/2025Saaa08/switchs/switch3";
+    bool ok = Firebase.RTDB.setBool(&fbdo, path, currentRelayState[relayIndex]);
+    if (!ok)
+        Serial.print("Firebase error: "), Serial.println(fbdo.errorReason());
+    return ok;
+}
+
+void deleteFirebaseData() {
+    if (Firebase.ready()) {
+        Serial.println("Attempting to delete Firebase data...");
+        if (Firebase.RTDB.deleteNode(&fbdo, "/2025Saaa08/switchs")) {
+            Serial.println("Firebase data deleted successfully");
+        } else {
+            Serial.print("Failed to delete Firebase data: ");
+            Serial.println(fbdo.errorReason());
+        }
+    }
+}
+
+// -------------  Connection State Machine  -------------
+void updateConnectionState(unsigned long now) {
+    switch (connectionState) {
+        case STATE_DISCONNECTED:
+            if (now - lastConnectionAttempt >= WIFI_RETRY_INTERVAL) {
+                attemptWiFiConnection();
+                lastConnectionAttempt = now;
+                Serial.println("WiFi retry...");
+            }
+            break;
+        case STATE_WIFI_CONNECTING:
+            if (WiFi.status() == WL_CONNECTED) {
+                connectionState = STATE_WIFI_CONNECTED;
+                Serial.println("WiFi connected!");
+            } else if (now - lastConnectionAttempt > WIFI_RETRY_INTERVAL) {
+                connectionState = STATE_DISCONNECTED;
+            }
+            break;
+        case STATE_WIFI_CONNECTED:
+            initializeFirebase();
+            connectionState = STATE_FIREBASE_CONNECTING;
+            lastConnectionAttempt = now;
+            Serial.println("Trying Firebase auth...");
+            break;
+        case STATE_FIREBASE_CONNECTING:
+            if (Firebase.ready()) {
+                connectionState = STATE_FIREBASE_CONNECTED;
+                Serial.println("Firebase connected!");
+                Firebase.RTDB.setBool(&fbdo, "/deviceStatus/online", true);
+                lastStatusUpdate = now;
+                // Initial push of relay states
+                for (int i = 0; i < 3; i++)
+                    updateFirebaseRelayState(i);
+            } else if (now - lastConnectionAttempt > WIFI_RETRY_INTERVAL) {
+                connectionState = STATE_WIFI_CONNECTED;
+            }
+            break;
+        case STATE_FIREBASE_CONNECTED:
+            if (WiFi.status() != WL_CONNECTED) {
+                connectionState = STATE_DISCONNECTED;
+                Serial.println("Lost WiFi");
+                Firebase.RTDB.setBool(&fbdo, "/deviceStatus/online", false);
+            } else if (!Firebase.ready()) {
+                connectionState = STATE_FIREBASE_CONNECTING;
+            }
+            break;
+    }
+}
+
+// -------------  Config Web Page  -------------
+String configPage() {
+    return R"rawliteral(
+<!DOCTYPE html>
+<html><head>
+<title>StoneAge Smart switch Configuration</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: Arial; margin: 20px; }
+  form { max-width: 300px; margin: 0 auto; }
+  input { width: 100%; padding: 10px; margin: 5px 0; }
+  .warn { color: #ff0000; font-size: 0.9em; }
+</style>
+</head><body>
+<h1>Device Configuration</h1>
+<div class="warn">All credentials are saved to device memory. Only use on trusted networks.</div>
+<form action="/save" method="post">
+  <h3>WiFi</h3>
+  <input type="text" name="ssid" placeholder="WiFi SSID" required>
+  <input type="password" name="password" placeholder="WiFi Password" required>
+  <h3>Firebase</h3>
+  <input type="email" name="fb_email" placeholder="Firebase Email" required>
+  <input type="password" name="fb_password" placeholder="Firebase Password" required>
+  <input type="submit" value="Save">
+</form>
+</body></html>
+)rawliteral";
+}
+
+// -------------  Start Config AP (WiFi + Firebase Setup)  -------------
+void startConfigurationAP() {
+    deleteFirebaseData();
+    WiFi.disconnect(true);
+    WiFi.softAP(CONFIG_AP_NAME, CONFIG_AP_PASSWORD);
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/html", configPage());
+    });
+    server.on("/save", HTTP_POST, []() {
+        String ssid = server.arg("ssid");
+        String pass = server.arg("password");
+        String fb_email = server.arg("fb_email");
+        String fb_pass = server.arg("fb_password");
+        writeEEPROM(SSID_ADDR, ssid);
+        writeEEPROM(PASS_ADDR, pass);
+        writeEEPROM(FIREBASE_EMAIL_ADDR, fb_email);
+        writeEEPROM(FIREBASE_PASS_ADDR, fb_pass);
+        EEPROM.commit();
+        server.send(200, "text/plain", "Saved. Restarting...");
+        delay(1200);
+        ESP.restart();
+    });
+    server.begin();
+    Serial.println("\nAP Started for config. Waiting for credentials (3 min timeout).");
+    configAPStartTime = millis();
+    deleteFirebaseData();
+    while (1) {
+        server.handleClient();
+        ledPattern(1);
+        if (millis() - configAPStartTime > CONFIG_AP_TIMEOUT) {
+            ESP.restart();
+        }
+        delay(30);
+    }
+}
+
+// -------------  Attempt WiFi & Firebase Connection  -------------
+void attemptWiFiConnection() {
+    String ssid = readEEPROM(SSID_ADDR);
+    String pass = readEEPROM(PASS_ADDR);
+    String fb_email = readEEPROM(FIREBASE_EMAIL_ADDR);
+    String fb_pass = readEEPROM(FIREBASE_PASS_ADDR);
+    if (ssid.length() > 0 && fb_email.length() > 0 && fb_pass.length() > 0) {
+        connectionState = STATE_WIFI_CONNECTING;
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        auth.user.email = fb_email;
+        auth.user.password = fb_pass;
+        lastConnectionAttempt = millis();
+        Serial.print("Connecting to WiFi...");
+    } else {
+        startConfigurationAP();
+    }
+}
+
+// -------------  Initialize Firebase (helper)  -------------
+void initializeFirebase() {
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+}
+
+// -------------  Setup  -------------
+void setup() {
+    Serial.begin(115200);
+    pinMode(relay0, OUTPUT); pinMode(relay1, OUTPUT); pinMode(relay2, OUTPUT);
+    pinMode(switch0, INPUT_PULLUP); pinMode(switch1, INPUT_PULLUP); pinMode(switch2, INPUT_PULLUP);
+    pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP); pinMode(STATUS_LED, OUTPUT);
+    EEPROM.begin(EEPROM_SIZE);
+    digitalWrite(relay0, LOW); digitalWrite(relay1, LOW); digitalWrite(relay2, LOW);
+
+    // **************************************************
+    // ** These lines MUST be in your code:
+    // ** Replace API_KEY and DATABASE_URL with your actual values
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+    // ** End of required Firebase config lines
+    // **************************************************
+
+    if (checkButtonHold()) {
+        startConfigurationAP();
+        inConfigMode = true;
+    } else {
+        attemptWiFiConnection();
+    }
+}
+
+// -------------  Main Loop  -------------
+void loop() {
+    if (inConfigMode) {
+        server.handleClient();
+        ledPattern(1);
+        return;
+    }
+    ledPattern(connectionState != STATE_FIREBASE_CONNECTED ? 2 : 0);
+
+    unsigned long now = millis();
+
+    // Heap Watchdog
+    if (ESP.getFreeHeap() < MIN_HEAP_BEFORE_CRASH) {
+        Serial.println("CRITICAL: Low heap. Restarting!");
+        delay(500);
+        ESP.restart();
+    }
+
+    // Switch Debouncing
+    handlePhysicalSwitches(now);
+
+    // State machine
+    updateConnectionState(now);
+
+    // Firebase ops
+    if (connectionState == STATE_FIREBASE_CONNECTED && Firebase.ready()) {
+        if (now - lastFirebaseUpdate >= FB_UPDATE_INTERVAL) {
+            bool ok = updateRelaysFromFirebase();
+            if (!ok && ++fbErrorCount >= MAX_FB_ERRORS) {
+                Serial.println("FB critical fail. Restarting...");
+                delay(500);
+                ESP.restart();
+            }
+            lastFirebaseUpdate = now;
+        }
+        if (now - lastStatusUpdate >= STATUS_UPDATE_INTERVAL) {
+            bool ok = Firebase.RTDB.setBool(&fbdo, "/deviceStatus/online", true);
+            if (!ok && ++fbErrorCount >= MAX_FB_ERRORS) {
+                Serial.println("FB status update fail. Restarting...");
+                delay(500);
+                ESP.restart();
+            }
+            lastStatusUpdate = now;
+        }
+        fbErrorCount = 0;
+    }
+    if (checkButtonHold()) {
+        startConfigurationAP();
+        inConfigMode = true;
+    }
+
+}
